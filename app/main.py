@@ -1,9 +1,14 @@
 """FastAPI 应用：数控刀路禁入区审查服务。"""
 from __future__ import annotations
 
+import hashlib
+import json
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from sqlalchemy import func, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .collision import (Zone, build_execution_trace, check_path,
@@ -14,18 +19,21 @@ from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
 from .models import Report, ZoneVersion
-from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse,
+from .schemas import (BatchItemResult, BatchReviewRequest, BatchReviewResponse,
+                      MinClearanceOut, ReviewRequest, ReviewResponse,
                       TraceEventOut, ZoneCreate, ZoneDetailOut, ZoneOut,
                       ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.3.0",
+    version="1.4.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
                 "可选多刀半径映射（tool_radii：刀号到毫米半径），"
-                "多刀模式随报告固化可回看的执行事件轨迹（execution_trace）。",
+                "多刀模式随报告固化可回看的执行事件轨迹（execution_trace）；"
+                "支持批量审查（POST /reviews/batch：带唯一 batch_id 的 1~50 项"
+                "有序任务，同一事务校验、幂等重放、冲突拒绝）。",
 )
 
 
@@ -200,10 +208,14 @@ def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int
     return zones, used, version_ids
 
 
-@app.post("/reviews", response_model=ReviewResponse,
-          summary="提交刀路审查并生成不可变报告")
-def review(payload: ReviewRequest,
-           db: Session = Depends(get_db)) -> ReviewResponse:
+def _prepare_review(db: Session,
+                    payload: ReviewRequest) -> tuple[Report, ReviewResponse]:
+    """校验并计算单项审查，返回未落库的 Report 与响应体（report_id 待回填）。
+
+    只读数据库（加载并固化所引用的禁区版本快照），不执行任何写入；
+    非法输入抛 HTTPException（404/422）或 GeometryError，由调用方决定呈现方式。
+    单项端点与批量端点共用本函数，保证审查口径完全一致。
+    """
     if payload.tool_radius < 0:
         raise HTTPException(status_code=422, detail="刀具半径不得为负")
 
@@ -333,12 +345,9 @@ def review(payload: ReviewRequest,
         min_clearance=clearance_payload,
         execution_trace=trace_payload,
     )
-    db.add(report)
-    db.commit()
-    db.refresh(report)
-
-    return ReviewResponse(
-        report_id=report.id, used_zone_versions=used_versions,
+    resp = ReviewResponse(
+        report_id=0,  # 占位：由调用方落库后回填真实报告编号
+        used_zone_versions=used_versions,
         input_summary=summary, has_collision=has_coll,
         collision_line_no=line_no, collision_zone_no=zone_no,
         conclusion=conclusion, message=message,
@@ -349,6 +358,136 @@ def review(payload: ReviewRequest,
         collision_tool_radius_mm=collision_tool_radius,
         execution_trace=[TraceEventOut(**e) for e in trace_payload]
         if trace_payload is not None else None)
+    return report, resp
+
+
+@app.post("/reviews", response_model=ReviewResponse,
+          summary="提交刀路审查并生成不可变报告")
+def review(payload: ReviewRequest,
+           db: Session = Depends(get_db)) -> ReviewResponse:
+    report, resp = _prepare_review(db, payload)
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    resp.report_id = report.id
+    return resp
+
+
+# ---------- 批量审查 ----------
+
+def _batch_content_hash(tasks: list) -> str:
+    """任务列表的规范化 SHA-256（JSON 键序无关），用于重放/冲突判定。"""
+    canonical = json.dumps(tasks, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _item_error_from_http(idx: int, exc: HTTPException) -> dict:
+    """把单项审查抛出的 HTTPException 归一化为逐项错误条目。"""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return {"index": idx, **detail}
+    kind = "zone_not_found" if exc.status_code == 404 else "invalid_params"
+    return {"index": idx, "error": kind, "message": str(detail)}
+
+
+def _batch_response(existing: models.Batch) -> BatchReviewResponse:
+    """按固化的首次逐项结果快照重建批量响应（重放与首次响应一致）。"""
+    return BatchReviewResponse(
+        batch_id=existing.batch_id, item_count=existing.item_count,
+        items=[BatchItemResult(**it) for it in existing.items])
+
+
+def _batch_replay_or_conflict(existing: models.Batch,
+                              content_hash: str) -> BatchReviewResponse:
+    """相同 batch_id：内容一致 => 返回首次逐项结果；内容不同 => 409 冲突。"""
+    if existing.content_hash == content_hash:
+        return _batch_response(existing)
+    raise HTTPException(status_code=409, detail={
+        "error": "batch_conflict",
+        "batch_id": existing.batch_id,
+        "message": f"batch_id {existing.batch_id!r} 已用于不同内容的提交，"
+                   "本次整批未生成报告",
+    })
+
+
+@app.post("/reviews/batch", response_model=BatchReviewResponse,
+          summary="批量提交有序刀路审查任务（1~50 项，同一事务，幂等重放）")
+def review_batch(payload: BatchReviewRequest,
+                 db: Session = Depends(get_db)) -> BatchReviewResponse:
+    content_hash = _batch_content_hash(payload.tasks)
+
+    # 幂等：相同 batch_id + 相同内容 => 首次逐项结果；不同内容 => 409 冲突
+    existing = db.scalar(select(models.Batch).where(
+        models.Batch.batch_id == payload.batch_id))
+    if existing is not None:
+        return _batch_replay_or_conflict(existing, content_hash)
+
+    # 第一阶段：同一事务中逐项校验（含固定各项引用的禁区版本快照），
+    # 收集全部逐项错误；任一任务非法 => 整批拒绝，不生成任何报告
+    prepared: list[tuple[int, Report, ReviewResponse]] = []
+    item_errors: list[dict] = []
+    for idx, raw in enumerate(payload.tasks):
+        try:
+            item = ReviewRequest.model_validate(raw)
+        except ValidationError as exc:
+            item_errors.append({
+                "index": idx,
+                "error": "invalid_params",
+                "message": "任务参数非法: " + "; ".join(
+                    f"{'.'.join(str(p) for p in e['loc']) or '(任务体)'}: "
+                    f"{e['msg']}" for e in exc.errors()),
+                "details": [{"loc": [str(p) for p in e["loc"]],
+                             "msg": e["msg"], "type": e["type"]}
+                            for e in exc.errors()],
+            })
+            continue
+        try:
+            report, resp = _prepare_review(db, item)
+        except HTTPException as exc:
+            item_errors.append(_item_error_from_http(idx, exc))
+            continue
+        except GeometryError as exc:
+            item_errors.append({"index": idx, "error": "invalid_geometry",
+                                "message": str(exc)})
+            continue
+        prepared.append((idx, report, resp))
+
+    if item_errors:
+        # 整批拒绝：本事务未写入任何内容，显式回滚防御，确保不生成报告
+        db.rollback()
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_batch",
+            "batch_id": payload.batch_id,
+            "item_errors": item_errors,
+        })
+
+    # 第二阶段：全部通过，按输入顺序在同一事务中生成不可变报告
+    items: list[BatchItemResult] = []
+    for idx, report, resp in prepared:
+        db.add(report)
+        db.flush()  # 分配报告编号
+        resp.report_id = report.id
+        items.append(BatchItemResult(index=idx, **resp.model_dump()))
+
+    # 固化批次快照（首次逐项结果），供相同 batch_id 重放时原样返回
+    db.add(models.Batch(
+        batch_id=payload.batch_id, content_hash=content_hash,
+        item_count=len(items),
+        items=[it.model_dump(mode="json") for it in items]))
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发下相同 batch_id 被抢先提交：按重放/冲突处理，不生成新报告
+        db.rollback()
+        winner = db.scalar(select(models.Batch).where(
+            models.Batch.batch_id == payload.batch_id))
+        if winner is not None:
+            return _batch_replay_or_conflict(winner, content_hash)
+        raise
+
+    return BatchReviewResponse(batch_id=payload.batch_id,
+                               item_count=len(items), items=items)
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -389,5 +528,4 @@ def health() -> dict:
 
 
 def __sha(text: str) -> str:
-    import hashlib
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

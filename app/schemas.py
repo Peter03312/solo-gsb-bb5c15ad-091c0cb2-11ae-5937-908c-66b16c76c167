@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -213,3 +214,42 @@ class ReviewResponse(BaseModel):
     # 多刀模式固化的执行事件轨迹（初始刀位 -> 各 T 切换静止刀位 -> 各段运动）；
     # 单刀请求与旧报告为 null
     execution_trace: list[TraceEventOut] | None = None
+
+
+# 批次标识：1~128 位字母、数字、汉字（Unicode 单词字符）或 ._-:
+BATCH_ID_RE = re.compile(r"^[\w.\-:]{1,128}$")
+
+
+class BatchReviewRequest(BaseModel):
+    """批量审查：一次提交带唯一 batch_id 的有序任务列表（1~50 项）。
+
+    tasks 中每项结构与 POST /reviews 请求体相同（禁区编号+明确版本、
+    初始刀尖坐标、刀具半径、G-code，可选 include_min_clearance 与
+    tool_radii 多刀参数）。逐项校验：任一任务非法则整批拒绝且不生成报告；
+    全部通过才按输入顺序生成不可变报告。相同 batch_id 与内容重放返回
+    首次逐项结果；不同内容返回 409 冲突。
+    """
+    batch_id: str = Field(description="调用方提供的唯一批次标识")
+    tasks: list[Any] = Field(
+        min_length=1, max_length=50,
+        description="有序刀路任务列表（1~50 项），逐项同 POST /reviews 请求体")
+
+    @field_validator("batch_id")
+    @classmethod
+    def _batch_id_format(cls, v: str) -> str:
+        if not BATCH_ID_RE.match(v):
+            raise ValueError(
+                "batch_id 非法：须为 1~128 位字母、数字、汉字或 ._-: 字符")
+        return v
+
+
+class BatchItemResult(ReviewResponse):
+    """批量审查逐项结果：单项审查结果 + 任务在提交列表中的顺序号。"""
+    index: int = Field(description="任务在提交列表中的顺序号（从 0 起）")
+
+
+class BatchReviewResponse(BaseModel):
+    """批量审查响应：按输入顺序逐项返回报告编号与完整审查结果。"""
+    batch_id: str
+    item_count: int
+    items: list[BatchItemResult]

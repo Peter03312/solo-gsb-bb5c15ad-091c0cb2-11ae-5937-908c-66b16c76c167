@@ -36,6 +36,13 @@
   每项含原行号、刀号、半径、起止坐标与命中禁区编号（或空），可逐事件回看；
   首碰撞即轨迹中**首个命中事件**，可选最小净间隙沿同一事件顺序裁决；
 - 报告**一旦生成不可变**，后续禁区更新新版本不影响任何旧报告；
+- **批量审查**（`POST /reviews/batch`）：一次提交带唯一 `batch_id` 的有序刀路任务列表
+  （1～50 项），每项结构与 `POST /reviews` 相同（禁区编号及明确版本、初始刀尖坐标、
+  刀具半径、G-code，可选最小净间隙与多刀参数）；**同一事务**中先校验整批并固定各项
+  引用的禁区版本快照，任一任务非法返回**逐项错误**且**整批不生成报告**；全部通过才
+  按输入顺序生成不可变报告，逐项返回报告编号与完整审查结果，任务之间互不影响；
+  相同 `batch_id` 与内容重放返回**首次逐项结果**，不同内容返回 `409` 冲突且不生成新报告，
+  见下文「批量审查」；
 - 非法几何、负/非法刀具半径、非法圆弧、不支持的运动/坐标系指令、非法开关类型，以及多刀模式下
   非整数/负数 `T`、同行多个 `T`、未映射刀号、非法映射半径一律返回 `422`，**不留任何报告**。
 
@@ -57,7 +64,8 @@ docker compose up --build
 首次启动时应用会自动连接 PostgreSQL 并完成数据库表初始化（`create_all`），无需手工建表；
 对**升级前的旧库**会幂等补齐 `reports` 表的最小净间隙列（`ALTER TABLE ... ADD COLUMN`），
 v1.2 的多刀命中刀号/半径列（`collision_tool_no` / `collision_tool_radius`），
-以及 v1.3 的执行事件轨迹列（`execution_trace`）；
+以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 的 `batches` 批量快照表由
+`create_all` 自动创建；
 旧报告读取为 `min_clearance_enabled=false`、`min_clearance=null`，多刀字段为 `null`，
 `execution_trace=null`，旧请求行为不变。
 
@@ -308,6 +316,83 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
 
 `GET /reports/{report_id}`
 
+### 8. 批量审查（一次提交有序任务列表）
+
+`POST /reviews/batch`
+
+一次提交带唯一 `batch_id` 的有序刀路任务列表（**1～50 项**）。`tasks` 中每项结构与
+`POST /reviews` 请求体完全相同（禁区编号及明确版本、初始刀尖坐标、刀具半径、G-code，
+可选 `include_min_clearance` 与 `tool_radii`），每项独立审查、互不影响。
+
+```json
+{
+  "batch_id": "batch-2026-10-06-0001",
+  "tasks": [
+    {"zones": [{"zone_no": 1, "version": 1}],
+     "start": [-5.0, 5.0, 0.0], "tool_radius": 0.5,
+     "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n"},
+    {"zones": [{"zone_no": 1, "version": 1}],
+     "start": [-5.0, 11.0, 0.0], "tool_radius": 0.0,
+     "tool_radii": {"2": 2.0}, "include_min_clearance": true,
+     "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"}
+  ]
+}
+```
+
+`batch_id` 为调用方提供的批次标识：**1～128 位**字母、数字、汉字或 `._-:` 字符，
+全库唯一；非法标识返回 `422`。
+
+成功响应（`200`）：按**输入顺序**逐项返回 `index`（从 0 起）、`report_id` 与
+`POST /reviews` 完全一致的审查结果字段：
+
+```json
+{
+  "batch_id": "batch-2026-10-06-0001",
+  "item_count": 2,
+  "items": [
+    {"index": 0, "report_id": 11, "conclusion": "collision",
+     "has_collision": true, "collision_line_no": 2, "collision_zone_no": 1, "...": "..."},
+    {"index": 1, "report_id": 12, "conclusion": "collision",
+     "has_collision": true, "collision_line_no": 3, "collision_zone_no": 1,
+     "collision_tool_no": 2, "collision_tool_radius_mm": 2.0, "...": "..."}
+  ]
+}
+```
+
+语义要点：
+
+- **同一事务**：先逐项校验整批（含固定各项引用的禁区版本快照），全部通过才按输入
+  顺序生成不可变报告；报告编号随 `index` 递增，逐项报告可用 `GET /reports/{report_id}`
+  独立查询，与单项审查报告完全同构；
+- **逐项错误**：任一任务的几何（禁区/版本不存在等）、G-code、参数或任务标识非法时，
+  返回 `422` 与全部逐项错误，**整批不生成任何报告**，且该 `batch_id` 不被占用
+  （修正后可用同一 `batch_id` 重新提交）：
+
+```json
+{"detail": {"error": "invalid_batch", "batch_id": "batch-2026-10-06-0001",
+            "item_errors": [
+              {"index": 1, "error": "invalid_gcode", "line_no": 2,
+               "message": "第 2 行: 不支持的 G 代码 G54（...）"},
+              {"index": 3, "error": "zone_not_found", "message": "禁区 9 不存在"},
+              {"index": 4, "error": "invalid_params",
+               "message": "任务参数非法: tool_radius: ...", "details": ["..."]}]}}
+```
+
+  逐项错误的 `error` 取值：`invalid_gcode`（含 `line_no`）、`zone_not_found`
+  （禁区或版本不存在）、`invalid_params`（参数/任务体非法，含 `details`）、
+  `invalid_geometry`（存储几何防御性校验失败）；
+- **幂等重放**：相同 `batch_id` 与相同内容（任务列表按 JSON 键序无关的规范化比较）
+  再次提交时，返回**首次逐项结果**（响应与首次完全一致，不生成新报告）；
+- **冲突**：相同 `batch_id` 但内容不同（含任务增删、顺序变化、任一字段变化）时返回
+  `409`，不生成新报告：
+
+```json
+{"detail": {"error": "batch_conflict", "batch_id": "batch-2026-10-06-0001",
+            "message": "batch_id 'batch-2026-10-06-0001' 已用于不同内容的提交，本次整批未生成报告"}}
+```
+
+- 任务数量不在 1～50、`batch_id` 非法、`tasks` 非列表等请求体错误返回 `422`。
+
 ## 命令行调用示例
 
 另见 `examples/curl_examples.sh` 与 `examples/python_client.py`。
@@ -340,6 +425,16 @@ curl -s -X POST http://localhost:8080/reviews \
        "gcode":"T1 G1 X5 Y11 Z0\n"}'
 # 响应 execution_trace 依次为 initial / tool_change（命中）/ motion（命中），
 # 首碰撞即首个命中事件（第 1 行换刀点，刀号 1）
+
+# 批量审查：一次提交 2 项有序任务，同一事务校验，逐项返回报告编号与审查结果
+curl -s -X POST http://localhost:8080/reviews/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"batch-2026-10-06-0001","tasks":[
+        {"zones":[{"zone_no":1,"version":1}],"start":[-5,5,0],
+         "tool_radius":0.5,"gcode":"G1 X15 Y5 Z0\n"},
+        {"zones":[{"zone_no":1,"version":1}],"start":[-5,50,0],
+         "tool_radius":0.0,"gcode":"G1 X15 Y50 Z0\n"}]}'
+# 相同 batch_id + 相同内容重放 => 首次逐项结果；不同内容 => 409 冲突
 ```
 
 ## G-code 支持范围与拒绝策略
@@ -363,9 +458,9 @@ curl -s -X POST http://localhost:8080/reviews \
 
 ```
 app/
-  main.py        # FastAPI 路由：禁区/版本/审查/报告
-  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹输出）
-  models.py      # zones / zone_versions / reports 表
+  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/报告
+  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹、批量请求/响应输出）
+  models.py      # zones / zone_versions / reports / batches 表
   database.py    # 引擎与会话
   gcode.py       # G-code 词法/模态解析（含多刀 T 切换与静止换刀事件）
   geometry.py    # 多边形校验、点/线段/圆弧距离、弧-多边形最近点
@@ -389,6 +484,9 @@ python -m unittest tests.test_audit -v
 Z 窗口截取/边界接触为零/负值/无运动段/等值裁决/固化与兼容），多刀半径映射
 （同行/独立 T 生效、模态延续、初始刀位空刀号、静止换刀命中、按事件半径计算首碰撞与净间隙、
 等值执行顺序裁决、非法 T/非法映射 422 不落报告、旧库列迁移与单刀兼容），
-以及多刀执行事件轨迹（同行 T 与运动分别记录且换刀点先查、轨迹顺序与字段、
+多刀执行事件轨迹（同行 T 与运动分别记录且换刀点先查、轨迹顺序与字段、
 首碰撞对应首个命中事件、最小净间隙沿同一顺序裁决、轨迹随报告固化且不受禁区新版本影响、
-单刀请求与旧报告为 null）等场景。
+单刀请求与旧报告为 null），以及批量审查（按输入顺序生成报告且任务互不影响、
+逐项固定禁区版本快照、任一任务非法整批 422 不落报告且逐项返回错误、
+1～50 项数量与 batch_id 合法性校验、相同 batch_id 重放返回首次逐项结果、
+不同内容 409 冲突且不落报告、失败批次不占用 batch_id）等场景。

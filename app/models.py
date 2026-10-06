@@ -2,7 +2,8 @@
 
 - zones：禁区逻辑实体（编号唯一）；
 - zone_versions：禁区的不可变版本，每次修改产生新版本，旧版本保留；
-- reports：审查报告，创建后不可变，不随后续禁区版本变化。
+- reports：审查报告，创建后不可变，不随后续禁区版本变化；
+- batches：批量审查的首次逐项结果快照（batch_id 唯一），用于幂等重放与冲突判定。
 """
 from __future__ import annotations
 
@@ -84,3 +85,25 @@ class Report(Base):
     # [{seq, kind, line_no, tool_no, tool_radius_mm, start_mm, end_mm,
     #   hit_zone_no}, ...]；单刀请求与旧报告为 NULL
     execution_trace = Column(JSON, nullable=True)
+
+
+class Batch(Base):
+    """批量审查批次：同一 batch_id 的首次逐项结果快照（落库即不可变）。
+
+    仅当整批 1~50 项任务全部校验通过时才在同一事务中与全部报告一起落库；
+    校验失败的批次不落库、不占用 batch_id。相同 batch_id 重放时按
+    content_hash 判定：内容一致 => 原样返回首次逐项结果；不一致 => 409 冲突。
+    """
+
+    __tablename__ = "batches"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+    # 调用方提供的批次标识（全库唯一）
+    batch_id = Column(String(128), nullable=False, unique=True)
+    # 提交任务列表规范化（JSON 键序无关）后的 SHA-256，用于重放/冲突判定
+    content_hash = Column(String(64), nullable=False)
+    item_count = Column(Integer, nullable=False)
+    # 首次逐项结果快照：[{index, report_id, ...单项审查结果}]，重放时原样返回
+    items = Column(JSON, nullable=False)
