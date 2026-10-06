@@ -2,7 +2,8 @@
 
 - zones：禁区逻辑实体（编号唯一）；
 - zone_versions：禁区的不可变版本，每次修改产生新版本，旧版本保留；
-- reports：审查报告，创建后不可变，不随后续禁区版本变化。
+- reports：审查报告，创建后不可变，不随后续禁区版本变化；
+- batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）。
 """
 from __future__ import annotations
 
@@ -84,3 +85,24 @@ class Report(Base):
     # [{seq, kind, line_no, tool_no, tool_radius_mm, start_mm, end_mm,
     #   hit_zone_no}, ...]；单刀请求与旧报告为 NULL
     execution_trace = Column(JSON, nullable=True)
+
+
+class Batch(Base):
+    """批量审查批次：与整批报告在同一事务提交。
+
+    batch_id 为幂等键（唯一约束兜底并发）；content_hash 为批内容
+    （逐项规范化请求）的 SHA-256，用于区分重放与冲突：
+    相同 batch_id + 相同内容 => 重放首次逐项结果（results 快照原样返回）；
+    相同 batch_id + 不同内容 => 由 API 层返回 409，不新增行、不生成报告。
+    """
+
+    __tablename__ = "batches"
+
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(String(64), nullable=False, unique=True)
+    # 批内容（逐项规范化请求）的 SHA-256
+    content_hash = Column(String(64), nullable=False)
+    item_count = Column(Integer, nullable=False)
+    # 逐项结果快照 [{index, task_id, result: {report_id, ...}}]，按输入顺序
+    results = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)

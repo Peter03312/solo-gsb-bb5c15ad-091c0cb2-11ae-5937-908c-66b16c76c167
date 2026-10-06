@@ -1080,6 +1080,173 @@ class ExecutionTraceApiTests(unittest.TestCase):
                          404)
 
 
+class BatchReviewApiTests(unittest.TestCase):
+    """批量审查：同一事务、逐项错误、batch_id 幂等/冲突。"""
+
+    @classmethod
+    def setUpClass(cls):
+        client.post("/zones", json={"zone_no": 500, "polygon": SQUARE,
+                                    "z_min": -5, "z_max": 5})
+        # 第二版本平移到远处，用于验证各项独立引用版本快照
+        client.post("/zones/500/versions", json={
+            "polygon": [[100, 100], [110, 100], [110, 110], [100, 110]],
+            "z_min": -5, "z_max": 5})
+
+    def _item(self, **kw):
+        item = {"zones": [{"zone_no": 500, "version": 1}],
+                "start": [-5, 5, 0], "tool_radius": 0.0,
+                "gcode": "G1 X15 Y5 Z0\n"}
+        item.update(kw)
+        return item
+
+    def _post(self, batch_id, items):
+        return client.post("/reviews/batch",
+                           json={"batch_id": batch_id, "items": items})
+
+    def _last_report_id(self):
+        # 提交一条确定无碰撞的单项审查，用其 report_id 定位报告序列末端
+        r = client.post("/reviews", json={
+            "zones": [{"zone_no": 500, "version": 2}],
+            "start": [-5, 5, 0], "tool_radius": 0.0, "gcode": "G1 X15 Y5 Z0\n"})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["report_id"]
+
+    def test_01_happy_path_ordered_results(self):
+        items = [
+            self._item(task_id="hit"),                       # v1 横穿 => 碰撞
+            self._item(task_id="safe", start=[-5, 50, 0],
+                       gcode="G1 X15 Y50 Z0\n"),             # 上方经过 => 无碰撞
+            self._item(task_id="mt", start=[-5, 11, 0],
+                       tool_radii={"2": 2.0},
+                       gcode="G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n",
+                       include_min_clearance=True),          # 多刀 + 净间隙
+        ]
+        r = self._post("B-001", items)
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        self.assertEqual(body["batch_id"], "B-001")
+        self.assertEqual(body["item_count"], 3)
+        results = body["results"]
+        self.assertEqual([x["index"] for x in results], [0, 1, 2])
+        self.assertEqual([x["task_id"] for x in results],
+                         ["hit", "safe", "mt"])
+        # 报告按输入顺序生成，编号递增
+        ids = [x["result"]["report_id"] for x in results]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(set(ids)), 3)
+        # 各项结果与单项审查口径一致
+        r0, r1, r2 = (x["result"] for x in results)
+        self.assertTrue(r0["has_collision"])
+        self.assertEqual(r0["collision_zone_no"], 500)
+        self.assertFalse(r1["has_collision"])
+        self.assertTrue(r2["has_collision"])
+        self.assertEqual(r2["collision_tool_no"], 2)
+        self.assertEqual(r2["collision_tool_radius_mm"], 2.0)
+        self.assertIsNotNone(r2["execution_trace"])
+        self.assertIsNotNone(r2["min_clearance"])
+        self.assertEqual(r2["used_zone_versions"], {"500": 1})
+        # 报告真实落库且不可变查询一致
+        for x in results:
+            got = client.get(
+                f"/reports/{x['result']['report_id']}").json()
+            self.assertEqual(got["has_collision"],
+                             x["result"]["has_collision"])
+            self.assertEqual(got["used_zone_versions"],
+                             x["result"]["used_zone_versions"])
+
+    def test_02_items_independent_zone_versions(self):
+        # 同一禁区不同版本：v1 碰撞、v2 无碰撞，互不影响
+        items = [self._item(task_id="v1"),
+                 self._item(task_id="v2",
+                            zones=[{"zone_no": 500, "version": 2}])]
+        r = self._post("B-002", items)
+        self.assertEqual(r.status_code, 201, r.text)
+        a, b = (x["result"] for x in r.json()["results"])
+        self.assertTrue(a["has_collision"])
+        self.assertEqual(a["used_zone_versions"], {"500": 1})
+        self.assertFalse(b["has_collision"])
+        self.assertEqual(b["used_zone_versions"], {"500": 2})
+
+    def test_03_any_invalid_item_fails_whole_batch(self):
+        last_id = self._last_report_id()
+        items = [
+            self._item(task_id="ok1"),
+            self._item(task_id="bad-gcode", gcode="G54 G1 X1\n"),
+            self._item(task_id="bad-zone",
+                       zones=[{"zone_no": 999, "version": 1}]),
+            self._item(task_id="ok2"),
+        ]
+        r = self._post("B-003", items)
+        self.assertEqual(r.status_code, 422, r.text)
+        body = r.json()
+        self.assertEqual(body["error"], "invalid_batch")
+        self.assertEqual(body["batch_id"], "B-003")
+        # 逐项错误：仅列出失败项，含输入顺序号与任务标识
+        failed = body["failed_items"]
+        self.assertEqual([f["index"] for f in failed], [1, 2])
+        self.assertEqual([f["task_id"] for f in failed],
+                         ["bad-gcode", "bad-zone"])
+        self.assertEqual(failed[0]["error"]["error"], "invalid_gcode")
+        self.assertIn("不存在", failed[1]["error"])
+        # 整批不生成报告：序列末端未推进
+        self.assertEqual(self._last_report_id(), last_id + 1)
+        # 失败的批次不占用 batch_id：修正后可同名成功提交
+        items[1]["gcode"] = "G1 X15 Y50 Z0\n"
+        items[2]["zones"] = [{"zone_no": 500, "version": 1}]
+        r = self._post("B-003", items)
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["item_count"], 4)
+
+    def test_04_invalid_task_identifier_rejected(self):
+        # 非法任务标识（空格/非法字符）=> 422，整批不落报告
+        last_id = self._last_report_id()
+        r = self._post("B-004", [self._item(task_id="bad id!")])
+        self.assertEqual(r.status_code, 422)
+        # 批内任务标识重复 => 422
+        r = self._post("B-004", [self._item(task_id="dup"),
+                                 self._item(task_id="dup")])
+        self.assertEqual(r.status_code, 422)
+        # 非法 batch_id 同样 422
+        r = self._post("bad batch!", [self._item()])
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(self._last_report_id(), last_id + 1)
+
+    def test_05_item_count_bounds(self):
+        r = self._post("B-005", [])
+        self.assertEqual(r.status_code, 422)
+        r = self._post("B-005", [self._item() for _ in range(51)])
+        self.assertEqual(r.status_code, 422)
+        r = self._post("B-005", [self._item() for _ in range(50)])
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["item_count"], 50)
+
+    def test_06_replay_returns_first_results(self):
+        items = [self._item(task_id="a"),
+                 self._item(task_id="b", start=[-5, 50, 0],
+                            gcode="G1 X15 Y50 Z0\n")]
+        r = self._post("B-006", items)
+        self.assertEqual(r.status_code, 201, r.text)
+        first = r.json()
+        last_id = self._last_report_id()
+
+        # 相同 batch_id + 相同内容重放：200，逐项结果与首次完全一致
+        r = self._post("B-006", items)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), first)
+        # 重放不生成新报告
+        self.assertEqual(self._last_report_id(), last_id + 1)
+
+    def test_07_same_batch_id_different_content_conflicts(self):
+        r = self._post("B-007", [self._item()])
+        self.assertEqual(r.status_code, 201, r.text)
+        last_id = self._last_report_id()
+        # 相同 batch_id、不同内容 => 409，且不生成新报告
+        r = self._post("B-007", [self._item(gcode="G1 X15 Y50 Z0\n")])
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["detail"]["error"], "batch_conflict")
+        self.assertEqual(self._last_report_id(), last_id + 1)
+
+
 class SchemaMigrationTests(unittest.TestCase):
     """旧库（缺少 v1.1/v1.2/v1.3 新列）启动时幂等补齐，旧报告读取兼容。"""
 

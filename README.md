@@ -35,6 +35,11 @@
   按执行顺序记录**初始刀位、每次 T 切换时的静止刀位（含与运动同行）与每段运动**，
   每项含原行号、刀号、半径、起止坐标与命中禁区编号（或空），可逐事件回看；
   首碰撞即轨迹中**首个命中事件**，可选最小净间隙沿同一事件顺序裁决；
+- **批量审查**（`POST /reviews/batch`，见下文「批量审查」）：一次提交带唯一
+  `batch_id` 的 **1～50 项有序任务**，每项独立给出禁区版本、初始刀尖坐标、刀具半径、
+  G-code 及可选最小净间隙/多刀参数；**同一事务**中先校验整批并固定各项禁区版本快照，
+  任一项非法返回**逐项错误**且整批不落报告，全部通过才按输入顺序生成不可变报告；
+  相同 `batch_id` 重放按内容判定幂等/冲突；
 - 报告**一旦生成不可变**，后续禁区更新新版本不影响任何旧报告；
 - 非法几何、负/非法刀具半径、非法圆弧、不支持的运动/坐标系指令、非法开关类型，以及多刀模式下
   非整数/负数 `T`、同行多个 `T`、未映射刀号、非法映射半径一律返回 `422`，**不留任何报告**。
@@ -57,7 +62,8 @@ docker compose up --build
 首次启动时应用会自动连接 PostgreSQL 并完成数据库表初始化（`create_all`），无需手工建表；
 对**升级前的旧库**会幂等补齐 `reports` 表的最小净间隙列（`ALTER TABLE ... ADD COLUMN`），
 v1.2 的多刀命中刀号/半径列（`collision_tool_no` / `collision_tool_radius`），
-以及 v1.3 的执行事件轨迹列（`execution_trace`）；
+以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表
+由 `create_all` 对旧库幂等建出。
 旧报告读取为 `min_clearance_enabled=false`、`min_clearance=null`，多刀字段为 `null`，
 `execution_trace=null`，旧请求行为不变。
 
@@ -304,7 +310,73 @@ JSON 键写为十进制整数字符串（如 `"2"`；`"1.5"`、`"-1"`、`"abc"` 
   旧客户端解析不受影响；
 - 非法 `T` 仍按原规则 `422` 拒绝且**不留任何报告**（自然也不产生轨迹）。
 
-### 7. 查询报告（不可变）
+### 7. 批量审查（一次提交 1～50 项有序任务，`batch_id` 幂等）
+
+`POST /reviews/batch`
+
+```json
+{
+  "batch_id": "B-20261006-001",
+  "items": [
+    {"task_id": "pocket-1",
+     "zones": [{"zone_no": 1, "version": 1}],
+     "start": [-5, 5, 0], "tool_radius": 0.5,
+     "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n",
+     "include_min_clearance": true},
+    {"task_id": "drill-2",
+     "zones": [{"zone_no": 1, "version": 1}],
+     "start": [-5, 11, 0], "tool_radius": 0.0,
+     "tool_radii": {"2": 2.0},
+     "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"}
+  ]
+}
+```
+
+- `batch_id`：批次幂等键，必填；字母数字开头，可含 `_ . : -`，最长 64。
+- `items`：**1～50 项**有序任务；每项为完整的单项审查输入（同 `POST /reviews`），
+  可另带可选 `task_id`（批内唯一，校验规则同 `batch_id`；省略时按输入顺序号标识）。
+  每项独立使用最小净间隙与多刀参数，任务之间互不影响。
+- **同一事务**：先逐项校验并固定各项引用的禁区版本快照，全部通过才按**输入顺序**
+  生成不可变报告并统一提交；任一项几何、G-code、参数或任务标识非法时，
+  返回 `422` 与**逐项错误**（`failed_items` 仅列失败项，含 `index`/`task_id`/`error`），
+  **整批不生成任何报告**，且该 `batch_id` 不被占用（修正后可同名重提）：
+
+```json
+{
+  "error": "invalid_batch",
+  "batch_id": "B-20261006-001",
+  "message": "批量审查未通过：1 项非法，整批未生成任何报告",
+  "failed_items": [
+    {"index": 1, "task_id": "drill-2",
+     "error": {"error": "invalid_gcode", "line_no": 2, "message": "第 2 行: ..."}}
+  ]
+}
+```
+
+- 全部通过返回 `201`，逐项给出输入顺序号、任务标识与完整单项审查结果
+  （含 `report_id`，可继续 `GET /reports/{report_id}` 回看）：
+
+```json
+{
+  "batch_id": "B-20261006-001",
+  "item_count": 2,
+  "results": [
+    {"index": 0, "task_id": "pocket-1",
+     "result": {"report_id": 11, "conclusion": "collision",
+                "has_collision": true, "collision_line_no": 2,
+                "collision_zone_no": 1, "...": "..."}},
+    {"index": 1, "task_id": "drill-2",
+     "result": {"report_id": 12, "conclusion": "no_collision", "...": "..."}}
+  ]
+}
+```
+
+- **幂等重放**：相同 `batch_id` + 相同内容再次提交返回 `200` 与**首次逐项结果**
+  （`report_id` 不变，不生成新报告）；相同 `batch_id` + 不同内容返回 `409`
+  （`batch_conflict`）且不生成新报告。内容按逐项规范化请求计算 SHA-256 判定；
+  并发同 `batch_id` 由数据库唯一约束兜底，结果一致。
+
+### 8. 查询报告（不可变）
 
 `GET /reports/{report_id}`
 
@@ -363,9 +435,9 @@ curl -s -X POST http://localhost:8080/reviews \
 
 ```
 app/
-  main.py        # FastAPI 路由：禁区/版本/审查/报告
-  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹输出）
-  models.py      # zones / zone_versions / reports 表
+  main.py        # FastAPI 路由：禁区/版本/审查/批量审查/报告
+  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹与批量输出）
+  models.py      # zones / zone_versions / reports / batches 表
   database.py    # 引擎与会话
   gcode.py       # G-code 词法/模态解析（含多刀 T 切换与静止换刀事件）
   geometry.py    # 多边形校验、点/线段/圆弧距离、弧-多边形最近点
@@ -389,6 +461,8 @@ python -m unittest tests.test_audit -v
 Z 窗口截取/边界接触为零/负值/无运动段/等值裁决/固化与兼容），多刀半径映射
 （同行/独立 T 生效、模态延续、初始刀位空刀号、静止换刀命中、按事件半径计算首碰撞与净间隙、
 等值执行顺序裁决、非法 T/非法映射 422 不落报告、旧库列迁移与单刀兼容），
-以及多刀执行事件轨迹（同行 T 与运动分别记录且换刀点先查、轨迹顺序与字段、
+多刀执行事件轨迹（同行 T 与运动分别记录且换刀点先查、轨迹顺序与字段、
 首碰撞对应首个命中事件、最小净间隙沿同一顺序裁决、轨迹随报告固化且不受禁区新版本影响、
-单刀请求与旧报告为 null）等场景。
+单刀请求与旧报告为 null），以及批量审查（有序逐项结果与报告编号、各项独立引用版本快照、
+任一项非法 422 逐项错误且整批不落报告、失败批次不占用 batch_id、任务/批次标识校验、
+1～50 项边界、相同 batch_id 重放返回首次结果、不同内容 409 冲突且不生成新报告）等场景。

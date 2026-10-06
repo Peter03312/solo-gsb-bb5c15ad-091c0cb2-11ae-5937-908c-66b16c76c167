@@ -158,3 +158,86 @@ LAST_REPORT=$(curl -s -X POST "$BASE/reviews" \
         "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"
       }' | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
 curl -s "$BASE/reports/$LAST_REPORT"; echo
+
+echo "== 16) 批量审查：一次提交 3 项有序任务（同一事务，batch_id 幂等） =="
+# 每项独立给出禁区版本/初始刀尖/刀半径/G-code，可带可选 task_id 与
+# 最小净间隙、多刀参数；全部通过才按输入顺序生成报告（201）
+curl -s -X POST "$BASE/reviews/batch" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_id": "B-20261006-001",
+        "items": [
+          {"task_id": "hit-v1",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 5, 0], "tool_radius": 0.5,
+           "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n",
+           "include_min_clearance": true},
+          {"task_id": "safe-high",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 50, 0], "tool_radius": 0.0,
+           "gcode": "G1 X15 Y50 Z0\n"},
+          {"task_id": "multi-tool",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 11, 0], "tool_radius": 0.0,
+           "tool_radii": {"2": 2.0},
+           "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"}
+        ]
+      }'; echo
+
+echo "== 17) 相同 batch_id + 相同内容重放：返回首次逐项结果（200，不生成新报告） =="
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews/batch" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_id": "B-20261006-001",
+        "items": [
+          {"task_id": "hit-v1",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 5, 0], "tool_radius": 0.5,
+           "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n",
+           "include_min_clearance": true},
+          {"task_id": "safe-high",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 50, 0], "tool_radius": 0.0,
+           "gcode": "G1 X15 Y50 Z0\n"},
+          {"task_id": "multi-tool",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 11, 0], "tool_radius": 0.0,
+           "tool_radii": {"2": 2.0},
+           "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"}
+        ]
+      }'
+
+echo "== 18) 相同 batch_id + 不同内容：409 冲突，不生成新报告 =="
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews/batch" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_id": "B-20261006-001",
+        "items": [
+          {"zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 50, 0], "tool_radius": 0.0,
+           "gcode": "G1 X15 Y50 Z0\n"}
+        ]
+      }'
+
+echo "== 19) 任一项非法：422 逐项错误，整批不生成任何报告 =="
+# 第 2 项 G-code 非法、第 3 项禁区不存在：failed_items 逐项列出，
+# 其余合法项也不会落报告；失败的 batch_id 不占用，修正后可同名重提
+curl -s -X POST "$BASE/reviews/batch" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_id": "B-20261006-002",
+        "items": [
+          {"task_id": "ok",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [-5, 50, 0], "tool_radius": 0.0,
+           "gcode": "G1 X15 Y50 Z0\n"},
+          {"task_id": "bad-gcode",
+           "zones": [{"zone_no": 1, "version": 1}],
+           "start": [0, 0, 0], "tool_radius": 0.0,
+           "gcode": "G54 G1 X1\n"},
+          {"task_id": "bad-zone",
+           "zones": [{"zone_no": 999, "version": 1}],
+           "start": [0, 0, 0], "tool_radius": 0.0,
+           "gcode": "G1 X1\n"}
+        ]
+      }'; echo

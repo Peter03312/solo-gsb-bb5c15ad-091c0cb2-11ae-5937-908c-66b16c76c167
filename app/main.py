@@ -1,9 +1,13 @@
 """FastAPI 应用：数控刀路禁入区审查服务。"""
 from __future__ import annotations
 
+import hashlib
+import json
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .collision import (Zone, build_execution_trace, check_path,
@@ -13,25 +17,29 @@ from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
-from .models import Report, ZoneVersion
-from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse,
+from .models import Batch, Report, ZoneVersion
+from .schemas import (BatchItemResult, BatchReviewRequest, BatchReviewResponse,
+                      MinClearanceOut, ReviewRequest, ReviewResponse,
                       TraceEventOut, ZoneCreate, ZoneDetailOut, ZoneOut,
                       ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.3.0",
+    version="1.4.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
                 "可选多刀半径映射（tool_radii：刀号到毫米半径），"
-                "多刀模式随报告固化可回看的执行事件轨迹（execution_trace）。",
+                "多刀模式随报告固化可回看的执行事件轨迹（execution_trace）；"
+                "支持一次提交 1～50 项有序任务的批量审查（/reviews/batch，"
+                "batch_id 幂等，整批同一事务）。",
 )
 
 
 @app.on_event("startup")
 def on_startup() -> None:
-    # 容器内由应用直接完成数据库初始化（表结构创建）
+    # 容器内由应用直接完成数据库初始化（表结构创建；v1.4 新增 batches 表
+    # 对旧库同样由 create_all 幂等建出）
     Base.metadata.create_all(bind=engine)
     # 旧库 reports 表缺少后续版本新增列：幂等补齐，保证旧请求/旧报告仍可读写
     _ensure_report_columns(engine)
@@ -200,10 +208,13 @@ def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int
     return zones, used, version_ids
 
 
-@app.post("/reviews", response_model=ReviewResponse,
-          summary="提交刀路审查并生成不可变报告")
-def review(payload: ReviewRequest,
-           db: Session = Depends(get_db)) -> ReviewResponse:
+def _build_review(db: Session, payload: ReviewRequest) -> ReviewResponse:
+    """校验并计算单项审查，构造 Report（加入会话并 flush，不 commit）。
+
+    调用方决定提交时机：单项端点立即提交；批量端点在同一事务中
+    先跑完整批再统一提交，任一项抛错即整体回滚、不留任何报告。
+    非法输入抛 HTTPException / GeometryError。
+    """
     if payload.tool_radius < 0:
         raise HTTPException(status_code=422, detail="刀具半径不得为负")
 
@@ -237,7 +248,7 @@ def review(payload: ReviewRequest,
         "start_position_mm": list(payload.start),
         "tool_radius_mm": payload.tool_radius,
         "final_position_mm": list(parsed.final_position),
-        "gcode_sha256": __sha(payload.gcode),
+        "gcode_sha256": _sha(payload.gcode),
         "include_min_clearance": bool(payload.include_min_clearance),
     }
     if multi_tool:
@@ -334,8 +345,7 @@ def review(payload: ReviewRequest,
         execution_trace=trace_payload,
     )
     db.add(report)
-    db.commit()
-    db.refresh(report)
+    db.flush()  # 取得 report.id；提交与否由调用方决定
 
     return ReviewResponse(
         report_id=report.id, used_zone_versions=used_versions,
@@ -349,6 +359,103 @@ def review(payload: ReviewRequest,
         collision_tool_radius_mm=collision_tool_radius,
         execution_trace=[TraceEventOut(**e) for e in trace_payload]
         if trace_payload is not None else None)
+
+
+@app.post("/reviews", response_model=ReviewResponse,
+          summary="提交刀路审查并生成不可变报告")
+def review(payload: ReviewRequest,
+           db: Session = Depends(get_db)) -> ReviewResponse:
+    resp = _build_review(db, payload)
+    db.commit()
+    return resp
+
+
+# ---------- 批量审查 ----------
+
+def _batch_content_hash(payload: BatchReviewRequest) -> str:
+    """批内容（逐项规范化请求）的 SHA-256，用于区分重放与冲突。"""
+    canonical = json.dumps(payload.model_dump(mode="json")["items"],
+                           sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _batch_response_body(batch_id: str, results: list[dict]) -> dict:
+    return {"batch_id": batch_id, "item_count": len(results),
+            "results": results}
+
+
+@app.post("/reviews/batch", response_model=BatchReviewResponse, status_code=201,
+          summary="批量提交有序刀路审查（1～50 项，同一事务，batch_id 幂等）")
+def review_batch(payload: BatchReviewRequest,
+                 db: Session = Depends(get_db)):
+    content_hash = _batch_content_hash(payload)
+
+    # 幂等：相同 batch_id 已入库 => 内容一致重放首次逐项结果，不一致 409
+    existing = db.scalar(select(Batch).where(Batch.batch_id == payload.batch_id))
+    if existing is not None:
+        if existing.content_hash != content_hash:
+            raise HTTPException(status_code=409, detail={
+                "error": "batch_conflict",
+                "batch_id": payload.batch_id,
+                "message": f"批次 {payload.batch_id!r} 已存在且内容不同，"
+                           "未生成新报告",
+            })
+        return JSONResponse(status_code=200, content=_batch_response_body(
+            existing.batch_id, existing.results))
+
+    # 同一事务中逐项校验并计算：任一项非法即记录逐项错误，整批回滚
+    results: list[BatchItemResult] = []
+    failed: list[dict] = []
+    for idx, item in enumerate(payload.items):
+        try:
+            res = _build_review(db, item)
+        except HTTPException as exc:
+            failed.append({"index": idx, "task_id": item.task_id,
+                           "error": exc.detail})
+        except GeometryError as exc:
+            failed.append({"index": idx, "task_id": item.task_id,
+                           "error": {"error": "invalid_geometry",
+                                     "detail": str(exc)}})
+        else:
+            results.append(BatchItemResult(index=idx, task_id=item.task_id,
+                                           result=res))
+
+    if failed:
+        # 整批不生成报告：回滚已 flush 的本批报告
+        db.rollback()
+        return JSONResponse(status_code=422, content={
+            "error": "invalid_batch",
+            "batch_id": payload.batch_id,
+            "message": f"批量审查未通过：{len(failed)} 项非法，"
+                       "整批未生成任何报告",
+            "failed_items": failed,
+        })
+
+    # 全部通过：按输入顺序固化逐项结果快照，与整批报告同一事务提交
+    stored = [{"index": r.index, "task_id": r.task_id,
+               "result": r.result.model_dump(mode="json")} for r in results]
+    db.add(Batch(batch_id=payload.batch_id, content_hash=content_hash,
+                 item_count=len(results), results=stored))
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发同 batch_id：唯一约束兜底，重放已入库的首次结果
+        db.rollback()
+        winner = db.scalar(select(Batch).where(
+            Batch.batch_id == payload.batch_id))
+        if winner is not None and winner.content_hash == content_hash:
+            return JSONResponse(status_code=200, content=_batch_response_body(
+                winner.batch_id, winner.results))
+        raise HTTPException(status_code=409, detail={
+            "error": "batch_conflict",
+            "batch_id": payload.batch_id,
+            "message": f"批次 {payload.batch_id!r} 已存在且内容不同，"
+                       "未生成新报告",
+        })
+
+    return BatchReviewResponse(batch_id=payload.batch_id,
+                               item_count=len(results), results=results)
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -388,6 +495,5 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-def __sha(text: str) -> str:
-    import hashlib
+def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

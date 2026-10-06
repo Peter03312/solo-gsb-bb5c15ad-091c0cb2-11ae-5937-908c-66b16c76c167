@@ -5,7 +5,7 @@ import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_serializer
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
 def _finite(v: float, name: str) -> float:
@@ -213,3 +213,50 @@ class ReviewResponse(BaseModel):
     # 多刀模式固化的执行事件轨迹（初始刀位 -> 各 T 切换静止刀位 -> 各段运动）；
     # 单刀请求与旧报告为 null
     execution_trace: list[TraceEventOut] | None = None
+
+
+# ---------- 批量审查 ----------
+
+# 批次/任务标识：字母数字开头，可含 _ . : -，最长 64
+_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$"
+
+
+class BatchReviewItem(ReviewRequest):
+    """批量审查中的单项任务：完整单项审查输入 + 可选批内唯一任务标识。"""
+    task_id: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=_ID_PATTERN,
+        description="批内唯一任务标识；省略时按输入顺序号标识")
+
+
+class BatchReviewRequest(BaseModel):
+    """批量审查请求：1～50 项有序任务，同一事务校验并生成报告。
+
+    batch_id 为幂等键：相同 batch_id + 相同内容重放返回首次逐项结果；
+    相同 batch_id + 不同内容返回 409 冲突且不生成新报告。
+    """
+    batch_id: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    items: list[BatchReviewItem] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def _unique_task_ids(self) -> "BatchReviewRequest":
+        seen: set[str] = set()
+        for it in self.items:
+            if it.task_id is None:
+                continue
+            if it.task_id in seen:
+                raise ValueError(f"任务标识 {it.task_id!r} 在批内重复")
+            seen.add(it.task_id)
+        return self
+
+
+class BatchItemResult(BaseModel):
+    """批量审查逐项结果：输入顺序号、任务标识与该项完整审查结果。"""
+    index: int = Field(description="任务在请求中的输入顺序号（从 0 起）")
+    task_id: str | None
+    result: ReviewResponse
+
+
+class BatchReviewResponse(BaseModel):
+    batch_id: str
+    item_count: int
+    results: list[BatchItemResult]

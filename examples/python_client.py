@@ -174,6 +174,81 @@ def main() -> None:
     snap = c.get(f"/reports/{body['report_id']}").json()
     assert snap["execution_trace"] == trace
 
+    # 11. 批量审查：一次提交带唯一 batch_id 的 1～50 项有序任务，同一事务。
+    #     每项独立给出禁区版本/初始刀尖/刀半径/G-code 与可选最小净间隙、多刀参数；
+    #     全部通过才按输入顺序生成不可变报告（201），逐项返回 report_id 与审查结果。
+    batch = {
+        "batch_id": "B-20261006-001",
+        "items": [
+            {"task_id": "hit-v1",
+             "zones": [{"zone_no": 1, "version": 1}],
+             "start": [-5.0, 5.0, 0.0], "tool_radius": 0.5,
+             "gcode": "G21 G90 G17\nG1 X15 Y5 Z0\n",
+             "include_min_clearance": True},
+            {"task_id": "safe-high",
+             "zones": [{"zone_no": 1, "version": 1}],
+             "start": [-5.0, 50.0, 0.0], "tool_radius": 0.0,
+             "gcode": "G1 X15 Y50 Z0\n"},
+            {"task_id": "multi-tool",
+             "zones": [{"zone_no": 1, "version": 1}],
+             "start": [-5.0, 11.0, 0.0], "tool_radius": 0.0,
+             "tool_radii": {"2": 2.0},
+             "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"},
+        ],
+    }
+    r = c.post("/reviews/batch", json=batch)
+    r.raise_for_status()  # 201
+    body = r.json()
+    print("batch:", body["batch_id"], "items:", body["item_count"])
+    for item in body["results"]:
+        res = item["result"]
+        print(" ", item["index"], item["task_id"],
+              "report", res["report_id"], res["conclusion"])
+    assert [x["task_id"] for x in body["results"]] == [
+        "hit-v1", "safe-high", "multi-tool"]
+    assert body["results"][0]["result"]["has_collision"] is True
+    assert body["results"][1]["result"]["has_collision"] is False
+    # 每项报告均可单独回看，内容一致
+    rid0 = body["results"][0]["result"]["report_id"]
+    assert c.get(f"/reports/{rid0}").json()["has_collision"] is True
+
+    # 相同 batch_id + 相同内容重放：200，逐项结果与首次完全一致（不生成新报告）
+    replay = c.post("/reviews/batch", json=batch)
+    assert replay.status_code == 200
+    assert replay.json() == body
+    print("batch replay: identical results, no new reports")
+
+    # 相同 batch_id + 不同内容：409 冲突，不生成新报告
+    conflict = c.post("/reviews/batch", json={
+        "batch_id": "B-20261006-001",
+        "items": [{"zones": [{"zone_no": 1, "version": 1}],
+                   "start": [-5.0, 50.0, 0.0], "tool_radius": 0.0,
+                   "gcode": "G1 X15 Y50 Z0\n"}],
+    })
+    assert conflict.status_code == 409
+    print("batch conflict:", conflict.json()["detail"]["error"])
+
+    # 任一项非法：422 逐项错误，整批不生成任何报告（batch_id 不被占用）
+    bad = c.post("/reviews/batch", json={
+        "batch_id": "B-20261006-002",
+        "items": [
+            {"task_id": "ok",
+             "zones": [{"zone_no": 1, "version": 1}],
+             "start": [-5.0, 50.0, 0.0], "tool_radius": 0.0,
+             "gcode": "G1 X15 Y50 Z0\n"},
+            {"task_id": "bad-gcode",
+             "zones": [{"zone_no": 1, "version": 1}],
+             "start": [0.0, 0.0, 0.0], "tool_radius": 0.0,
+             "gcode": "G54 G1 X1\n"},
+        ],
+    })
+    assert bad.status_code == 422
+    err = bad.json()
+    print("invalid batch:", err["message"])
+    for f in err["failed_items"]:
+        print("  failed item:", f["index"], f["task_id"], f["error"])
+    assert [f["task_id"] for f in err["failed_items"]] == ["bad-gcode"]
+
 
 if __name__ == "__main__":
     main()
